@@ -1,0 +1,15 @@
+README.md
+pyproject.toml
+./__init__.py
+./client.py
+./inference.py
+./models.py
+openenv_calender_en.egg-info/PKG-INFO
+openenv_calender_en.egg-info/SOURCES.txt
+openenv_calender_en.egg-info/dependency_links.txt
+openenv_calender_en.egg-info/entry_points.txt
+openenv_calender_en.egg-info/requires.txt
+openenv_calender_en.egg-info/top_level.txt
+server/__init__.py
+server/app.py
+server/calender_en_environment.py

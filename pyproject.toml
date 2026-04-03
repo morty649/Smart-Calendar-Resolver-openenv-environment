@@ -1,0 +1,13 @@
+[project]
+name = "calender-env-v1"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "openenv-core[core]>=0.2.2",
+    "pytest>=8.0.0",
+]
+
+[project.scripts]
+server = "server.app:main"
