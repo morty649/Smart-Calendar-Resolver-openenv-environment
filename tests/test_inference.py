@@ -28,3 +28,14 @@ def test_inference_output_is_deterministic() -> None:
         inference.main()
 
     assert first.getvalue() == second.getvalue()
+
+
+def test_inference_reads_model_name_from_environment(monkeypatch) -> None:
+    output = StringIO()
+    monkeypatch.setenv("MODEL_NAME", "hf-eval-check")
+
+    with redirect_stdout(output):
+        inference.main()
+
+    lines = output.getvalue().strip().splitlines()
+    assert lines[0] == "[START] task=smart_calendar_resolution env=calender_en model=hf-eval-check"
