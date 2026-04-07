@@ -164,7 +164,8 @@ Characteristics:
 - follows correct stage sequence
 - selects known valid slot
 - produces consistent output
-- no external model dependency
+- uses the injected OpenAI-compatible proxy when `API_BASE_URL`, `API_KEY`, and `MODEL_NAME` are present
+- falls back to the deterministic local baseline when those submission env vars are absent
 
 ### Required Output Format
 
