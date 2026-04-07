@@ -1,3 +1,14 @@
+---
+title: Smart Calendar Resolver
+emoji: 📅
+colorFrom: blue
+colorTo: green
+sdk: docker
+app_file: app.py
+pinned: false
+---
+
+
 # Smart Calendar Resolver — OpenEnv Environment
 
 A deterministic, multi-step OpenEnv environment for evaluating agent reasoning in real-world scheduling workflows.

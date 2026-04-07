@@ -2,84 +2,176 @@
 
 import json
 import os
-from typing import Any, List
-
-try:
-    from calender_en.models import CalenderEnAction
-    from calender_en.server.calender_en_environment import CalenderEnEnvironment
-except ModuleNotFoundError:
-    from models import CalenderEnAction
-    from server.calender_en_environment import CalenderEnEnvironment
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any, List, Optional
 
 from openai import OpenAI
+
+try:
+    from calender_en.client import CalenderEnEnv
+    from calender_en.models import CalenderEnAction, CalenderEnObservation
+    from calender_en.server.calender_en_environment import CalenderEnEnvironment
+except ModuleNotFoundError:
+    from client import CalenderEnEnv
+    from models import CalenderEnAction, CalenderEnObservation
+    from server.calender_en_environment import CalenderEnEnvironment
 
 TASK_NAME = "smart_calendar_resolution"
 ENV_NAME = "calender_en"
 DEFAULT_MODEL_NAME = "deterministic-baseline"
 
 
-def _policy() -> List[CalenderEnAction]:
-    return [
-        CalenderEnAction(
-            stage="understand_request",
-            final_note="Identify the meeting objective, participants, and deadline.",
-        ),
-        CalenderEnAction(
-            stage="evaluate_availability",
-            final_note="Intersect participant availability and filter slots before the deadline.",
-        ),
-        CalenderEnAction(
-            stage="propose_slot",
-            proposed_time_slot="2026-04-08 10:00-10:30 UTC",
-            final_note="Choose the earliest common 30 minute slot before the deadline.",
-        ),
-        CalenderEnAction(
-            stage="confirm_schedule",
-            proposed_time_slot="2026-04-08 10:00-10:30 UTC",
-            confirm_schedule=True,
-            final_note="Confirmed with all participants and calendar invite is ready.",
-        ),
-    ]
+@dataclass
+class InferenceConfig:
+    env_base_url: str = field(default_factory=lambda: os.getenv("ENV_BASE_URL", ""))
+    llm_api_base_url: str = field(default_factory=lambda: os.getenv("API_BASE_URL", ""))
+    llm_api_key: str = field(default_factory=lambda: os.getenv("API_KEY", ""))
+    model_name: str = field(
+        default_factory=lambda: os.getenv("MODEL_NAME", DEFAULT_MODEL_NAME)
+    )
 
 
-def _env(name: str) -> str | None:
-    value = os.getenv(name)
-    if value is None:
+@dataclass
+class StepOutcome:
+    observation: CalenderEnObservation
+    reward: float
+    done: bool
+
+
+class LocalEnvRunner:
+    def __init__(self) -> None:
+        self._env = CalenderEnEnvironment()
+
+    def reset(self) -> CalenderEnObservation:
+        return self._env.reset()
+
+    def step(self, action: CalenderEnAction) -> StepOutcome:
+        observation = self._env.step(action)
+        return StepOutcome(
+            observation=observation,
+            reward=float(observation.reward),
+            done=bool(observation.done),
+        )
+
+    def close(self) -> None:
         return None
-    value = value.strip()
-    return value or None
 
 
-def _should_use_llm_proxy() -> bool:
-    return _env("API_BASE_URL") is not None or _env("API_KEY") is not None
+class RemoteEnvRunner:
+    def __init__(self, base_url: str) -> None:
+        self._client = CalenderEnEnv(base_url=base_url)
+
+    def reset(self) -> CalenderEnObservation:
+        return self._client.reset().observation
+
+    def step(self, action: CalenderEnAction) -> StepOutcome:
+        result = self._client.step(action)
+        return StepOutcome(
+            observation=result.observation,
+            reward=float(result.reward or 0.0),
+            done=bool(result.done),
+        )
+
+    def close(self) -> None:
+        self._client.close()
 
 
-def _get_model_name() -> str:
-    return _env("MODEL_NAME") or DEFAULT_MODEL_NAME
+def _runner(config: InferenceConfig) -> LocalEnvRunner | RemoteEnvRunner:
+    if config.env_base_url:
+        return RemoteEnvRunner(config.env_base_url)
+    return LocalEnvRunner()
 
 
-def _create_client() -> OpenAI:
-    api_base_url = _env("API_BASE_URL")
-    api_key = _env("API_KEY")
-    model_name = _env("MODEL_NAME")
+def _should_use_llm_proxy(config: InferenceConfig) -> bool:
+    return bool(config.llm_api_base_url or config.llm_api_key)
 
+
+def _create_proxy_client(config: InferenceConfig) -> OpenAI:
     missing = [
         name
         for name, value in (
-            ("API_BASE_URL", api_base_url),
-            ("API_KEY", api_key),
-            ("MODEL_NAME", model_name),
+            ("API_BASE_URL", config.llm_api_base_url),
+            ("API_KEY", config.llm_api_key),
+            ("MODEL_NAME", config.model_name),
         )
-        if value is None
+        if not value
     ]
     if missing:
-        missing_text = ", ".join(missing)
         raise RuntimeError(
             "Missing required hackathon environment variables: "
-            f"{missing_text}. The validator injects these automatically."
+            + ", ".join(missing)
+        )
+    return OpenAI(base_url=config.llm_api_base_url, api_key=config.llm_api_key)
+
+
+def _common_slots(observation: CalenderEnObservation) -> List[str]:
+    participant_slots = [set(slots) for slots in observation.availability.values()]
+    if not participant_slots:
+        raise ValueError("Observation does not include participant availability.")
+    return sorted(set.intersection(*participant_slots))
+
+
+def _parse_slot_start(slot: str) -> datetime:
+    return datetime.strptime(slot[:16], "%Y-%m-%d %H:%M")
+
+
+def _parse_deadline(deadline: str) -> datetime:
+    normalized = deadline.replace(" UTC", "")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"Unsupported deadline format: {deadline}")
+
+
+def _select_slot(observation: CalenderEnObservation) -> str:
+    common_slots = _common_slots(observation)
+    deadline = observation.constraints.get("deadline")
+    if deadline:
+        cutoff = _parse_deadline(deadline)
+        valid_slots = [slot for slot in common_slots if _parse_slot_start(slot) <= cutoff]
+        if valid_slots:
+            return valid_slots[0]
+    return common_slots[0]
+
+
+def _fallback_note(stage: str) -> str:
+    notes = {
+        "understand_request": "Identify the meeting objective, participants, and deadline.",
+        "evaluate_availability": "Intersect participant availability and filter slots before the deadline.",
+        "propose_slot": "Choose the earliest common 30 minute slot before the deadline.",
+        "confirm_schedule": "Confirmed with all participants and calendar invite is ready.",
+    }
+    return notes[stage]
+
+
+def _planned_action(observation: CalenderEnObservation) -> CalenderEnAction:
+    stage = observation.next_expected_stage
+    if stage is None:
+        raise ValueError("No next stage available.")
+
+    if stage == "understand_request":
+        return CalenderEnAction(stage=stage, final_note=_fallback_note(stage))
+
+    if stage == "evaluate_availability":
+        return CalenderEnAction(stage=stage, final_note=_fallback_note(stage))
+
+    slot = _select_slot(observation)
+    if stage == "propose_slot":
+        return CalenderEnAction(
+            stage=stage,
+            proposed_time_slot=slot,
+            final_note=_fallback_note(stage),
         )
 
-    return OpenAI(base_url=api_base_url, api_key=api_key)
+    return CalenderEnAction(
+        stage=stage,
+        proposed_time_slot=slot,
+        confirm_schedule=True,
+        final_note=_fallback_note(stage),
+    )
 
 
 def _extract_message_text(response: Any) -> str:
@@ -116,7 +208,8 @@ def _parse_action_json(payload: str) -> CalenderEnAction:
 
 def _generate_action_with_proxy(
     client: OpenAI,
-    observation: Any,
+    config: InferenceConfig,
+    observation: CalenderEnObservation,
     planned_action: CalenderEnAction,
 ) -> CalenderEnAction:
     prompt_payload = {
@@ -129,7 +222,7 @@ def _generate_action_with_proxy(
         "planned_action": planned_action.model_dump(),
     }
     response = client.chat.completions.create(
-        model=_get_model_name(),
+        model=config.model_name,
         temperature=0,
         messages=[
             {
@@ -160,51 +253,50 @@ def _format_action(action: CalenderEnAction) -> str:
 
 
 def main() -> None:
-    env = CalenderEnEnvironment()
+    config = InferenceConfig()
+    env = _runner(config)
     rewards: List[str] = []
     steps = 0
     success = False
-    use_llm_proxy = _should_use_llm_proxy()
-    client = _create_client() if use_llm_proxy else None
-    model_name = _get_model_name()
+    client = _create_proxy_client(config) if _should_use_llm_proxy(config) else None
 
-    print(f"[START] task={TASK_NAME} env={ENV_NAME} model={model_name}")
+    print(f"[START] task={TASK_NAME} env={ENV_NAME} model={config.model_name}")
 
     try:
         observation = env.reset()
-        for planned_action in _policy():
-            steps += 1
-            error = "null"
+        while not observation.done and observation.next_expected_stage is not None:
+            planned_action = _planned_action(observation)
             action = planned_action
+            steps += 1
             try:
-                action = (
-                    _generate_action_with_proxy(client, observation, planned_action)
-                    if client is not None
-                    else planned_action
-                )
-                observation = env.step(action)
-                reward_text = f"{observation.reward:.2f}"
-                done_text = str(observation.done).lower()
+                if client is not None:
+                    action = _generate_action_with_proxy(
+                        client, config, observation, planned_action
+                    )
+                outcome = env.step(action)
+                observation = outcome.observation
+                reward_text = f"{outcome.reward:.2f}"
                 rewards.append(reward_text)
                 print(
                     f"[STEP] step={steps} action={_format_action(action)} "
-                    f"reward={reward_text} done={done_text} error={error}"
+                    f"reward={reward_text} done={str(outcome.done).lower()} error=null"
                 )
-                success = observation.done
+                success = outcome.done
             except Exception as exc:
-                reward_text = "0.00"
-                rewards.append(reward_text)
+                rewards.append("0.00")
                 print(
                     f"[STEP] step={steps} action={_format_action(action)} "
-                    f"reward={reward_text} done=false error={str(exc)}"
+                    f"reward=0.00 done=false error={str(exc)}"
                 )
                 success = False
                 break
     except Exception:
         success = False
     finally:
-        rewards_text = ",".join(rewards)
-        print(f"[END] success={str(success).lower()} steps={steps} rewards={rewards_text}")
+        env.close()
+        print(
+            f"[END] success={str(success).lower()} steps={steps} rewards={','.join(rewards)}"
+        )
 
 
 if __name__ == "__main__":
